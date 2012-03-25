@@ -69,6 +69,8 @@ int main(int ac, char** av)
     goto on_error;
   }
 
+  printf("readn()\n");
+
   if (serial_readn(&h, buf, 8))
   {
     printf("serial_readn() == -1\n");

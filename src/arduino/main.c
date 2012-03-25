@@ -57,7 +57,7 @@ static void uart_write(uint8_t* s, uint8_t n)
   }
 }
 
-static inline uint8_t nibble(uint16_t x, uint8_t i)
+static inline uint8_t nibble(uint32_t x, uint8_t i)
 {
   return (x >> (i * 4)) & 0xf;
 }
@@ -99,31 +99,18 @@ static void wait_for_long(void)
 #endif /* unused */
 
 
-static void wait_for_short(void)
+static inline void pulse_pin(void)
 {
-  uint8_t counter;
-  for (counter = 0; counter != 5; ++counter) _delay_loop_2(10000);
+  PORTB |= 1 << 1;
+  _delay_loop_2(50000);
+  PORTB &= ~(1 << 1);
 }
 
 
-static void set_pin(uint8_t x)
-{
-  if (x) PORTB |= 1 << 1;
-  else PORTB &= ~(1 << 1);
-}
-
-
-static void pulse_pin(void)
-{
-  set_pin(1);
-  wait_for_short();
-  set_pin(0);
-}
-
-
-static volatile uint8_t is_done = 0;
+static volatile uint8_t is_done;
 static volatile uint16_t low_part;
 static volatile uint16_t high_part;
+static volatile uint8_t timeout;
 
 
 ISR(PCINT0_vect)
@@ -151,20 +138,26 @@ ISR(PCINT0_vect)
 ISR(TIMER1_OVF_vect)
 {
   /* timer1 overflow interrupt */
+  /* note: overflow flag automatically cleared */
   ++high_part;
 }
 
 
 ISR(TIMER2_OVF_vect)
 {
-  /* stop the counters */
-  TCCR1B &= ~(1 << 0);
-  TCCR2B &= ~(1 << 0);
+  /* note: overflow flag automatically cleared */
 
-  /* invalidate the counter */
-  low_part = (uint16_t)-1;
-  high_part = (uint16_t)-1;
-  is_done = 1;
+  if (--timeout == 0)
+  {
+    /* stop the counters */
+    TCCR1B &= ~(1 << 0);
+    TCCR2B &= ~(1 << 0);
+
+    /* invalidate the counter */
+    low_part = (uint16_t)-1;
+    high_part = (uint16_t)-1;
+    is_done = 1;
+  }
 }
 
 
@@ -180,19 +173,23 @@ int main(void)
   /* enable pullup */
   PORTB = 1;
 
+#if 0
   /* setup b1 as digital output */
   DDRB |= 1 << 1;
   PORTB &= ~(1 << 0);
+#endif
 
   /* enable interrupt on port change 0 */
-  PCICR = (1 << 0);
-  PCMSK0 = (1 << 0);
+  PCICR = 1 << 0;
+  PCMSK0 = 1 << 0;
 
   /* setup timer1, normal mode, interrupt on overflow */
+  TCCR1A = 0;
   TCCR1B = 0;
   TIMSK1 = 1;
 
   /* setup timer2, interrupt on overflow */
+  TCCR2A = 0;
   TCCR2B = 0;
   TIMSK2 = 1;
 
@@ -208,6 +205,7 @@ int main(void)
     is_done = 0;
 
     /* reset counters */
+    timeout = 122;
     low_part = 0;
     high_part = 0;
 
@@ -215,10 +213,9 @@ int main(void)
     TCNT1 = 0;
     TCNT2 = 0;
 
+    /* (1 / (16000000 / 1024)) * 122 = 2 seconds timeout */
+    TCCR2B = 7 << 0;
     TCCR1B = 1 << 0;
-
-    /* (16000000 / 1024) * 65536 ~= 4 seconds timeout */
-    TCCR2B = 3 << 0;
 
     /* fire */
     pulse_pin();
