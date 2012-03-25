@@ -4,39 +4,24 @@
 #include <util/delay.h>
 
 
-/* 8 io pins used (not contiguous since leds on d<0:1>):
-   portb<0:1>
-   portd<2:7>
+/* measure the time elapsed between firing and detection.
+
+   we assume the clock frequency is 16mhz and we have a 16
+   bits counter incremented once per tick
+
+   the distance resolution (ie. meter per bit) is:
+   v_proj * (1 / 16000000)
+
+   the max measurable distance before overflow is:
+   65535 * (v_proj * (1 / 16000000))
  */
 
 
-static void wait_for_long(void)
-{
-  uint16_t counter;
-  for (counter = 0; counter != 200; ++counter) _delay_loop_2(30000);
-}
+/* commands:
+   'f': fire
+ */
 
-
-static void wait_for_short(void)
-{
-  unsigned char counter;
-  for (counter = 0; counter != 5; ++counter) _delay_loop_2(10000);
-}
-
-
-static void set_pin(uint8_t x)
-{
-  if (x) PORTB |= 1 << 1;
-  else PORTB &= ~(1 << 1);
-}
-
-
-static void pulse_pin(void)
-{
-  set_pin(1);
-  wait_for_short();
-  set_pin(0);
-}
+/* uart */
 
 static void uart_setup(void)
 {
@@ -62,46 +47,83 @@ static void uart_setup(void)
   UCSR0C = (3 << 1);
 }
 
-
-static void uart_write(void)
+static void uart_write(uint8_t* s, uint8_t n)
 {
-  uint8_t x = 0;
-
-  for (; ; ++x)
+  for (; n; --n, ++s)
   {
     /* wait for transmit buffer to be empty */
     while (!(UCSR0A & (1 << UDRE0))) ;
-    UDR0 = x;
+    UDR0 = *s;
   }
 }
 
-
-#if 0
-static void uart_sync(void)
+static inline uint8_t nibble(uint16_t x, uint8_t i)
 {
-  uint8_t n = 0;
-  uint8_t x;
-  while (n < 4)
-  {
-    if (UCSR0A & (1 << 7))
-    {
-      x = UDR0;
-      if (x == 'x') ++n;
-    }
-  }
+  return (x >> (i * 4)) & 0xf;
 }
-#endif
 
-
-static volatile uint8_t has_changed = 0;
-static volatile uint32_t start;
-static volatile uint32_t stop;
-
-
-static inline uint32_t read_counter(void)
+static inline uint8_t hex(uint8_t x)
 {
-  return 0;
+  return (x >= 0xa) ? 'a' + x - 0xa : '0' + x;
 }
+
+static uint8_t* uint32_to_string(uint32_t x)
+{
+  static uint8_t buf[8];
+
+  buf[7] = hex(nibble(x, 0));
+  buf[6] = hex(nibble(x, 1));
+  buf[5] = hex(nibble(x, 2));
+  buf[4] = hex(nibble(x, 3));
+  buf[3] = hex(nibble(x, 4));
+  buf[2] = hex(nibble(x, 5));
+  buf[1] = hex(nibble(x, 6));
+  buf[0] = hex(nibble(x, 7));
+
+  return buf;
+}
+
+static inline uint8_t uart_read_byte(void)
+{
+  while ((UCSR0A & (1 << 7)) == 0) ;
+  return UDR0;
+}
+
+
+#if 0 /* unused */
+static void wait_for_long(void)
+{
+  uint16_t counter;
+  for (counter = 0; counter != 200; ++counter) _delay_loop_2(30000);
+}
+#endif /* unused */
+
+
+static void wait_for_short(void)
+{
+  uint8_t counter;
+  for (counter = 0; counter != 5; ++counter) _delay_loop_2(10000);
+}
+
+
+static void set_pin(uint8_t x)
+{
+  if (x) PORTB |= 1 << 1;
+  else PORTB &= ~(1 << 1);
+}
+
+
+static void pulse_pin(void)
+{
+  set_pin(1);
+  wait_for_short();
+  set_pin(0);
+}
+
+
+static volatile uint8_t is_done = 0;
+static volatile uint16_t low_part;
+static volatile uint16_t high_part;
 
 
 ISR(PCINT0_vect)
@@ -111,7 +133,14 @@ ISR(PCINT0_vect)
   /* TODO: check it comes from PB0 */
   if (PCIFR & (1 << 0))
   {
-    stop = read_counter();
+    /* stop the counters */
+    TCCR1B &= ~(1 << 0);
+    TCCR2B &= ~(1 << 0);
+
+    /* read the counter */
+    low_part = TCNT1;
+
+    is_done = 1;
 
     /* int ack */
     PCIFR = 1;
@@ -119,37 +148,86 @@ ISR(PCINT0_vect)
 }
 
 
-static void setup_counter(void)
+ISR(TIMER1_OVF_vect)
 {
-  TCCR1A = 0;
+  /* timer1 overflow interrupt */
+  ++high_part;
+}
+
+
+ISR(TIMER2_OVF_vect)
+{
+  /* stop the counters */
+  TCCR1B &= ~(1 << 0);
+  TCCR2B &= ~(1 << 0);
+
+  /* invalidate the counter */
+  low_part = (uint16_t)-1;
+  high_part = (uint16_t)-1;
+  is_done = 1;
 }
 
 
 int main(void)
 {
-#if 0
-  uart_setup();
-#endif
+  uint32_t counter;
+  uint8_t cmd;
 
-  /* digital output mode */
-  DDRB = 0xff;
-  PORTB = 0x00;
+  uart_setup();
+
+  /* setup interrupt on change for b0 */
+  DDRB &= 0xfe;
+  /* enable pullup */
+  PORTB = 1;
+
+  /* setup b1 as digital output */
+  DDRB |= 1 << 1;
+  PORTB &= ~(1 << 0);
+
+  /* enable interrupt on port change 0 */
+  PCICR = (1 << 0);
+  PCMSK0 = (1 << 0);
+
+  /* setup timer1, normal mode, interrupt on overflow */
+  TCCR1B = 0;
+  TIMSK1 = 1;
+
+  /* setup timer2, interrupt on overflow */
+  TCCR2B = 0;
+  TIMSK2 = 1;
+
+  /* global interrupt enable (SREG, i bit) */
+  sei();
 
   while (1)
   {
-    wait_for_long();
-    pulse_pin();
-    wait_for_short();
+    cmd = uart_read_byte();
+    if (cmd != 'f') continue ;
+
+    /* reset the waiting flag */
+    is_done = 0;
+
+    /* reset counters */
+    low_part = 0;
+    high_part = 0;
+
+    /* reload and start counters */
+    TCNT1 = 0;
+    TCNT2 = 0;
+
+    TCCR1B = 1 << 0;
+
+    /* (16000000 / 1024) * 65536 ~= 4 seconds timeout */
+    TCCR2B = 3 << 0;
+
+    /* fire */
     pulse_pin();
 
-#if 0
-    has_changed = 0;
-    start = read_counter();
-    wait_for_short();
-    pulse_pins(0 << 0);
-    while (has_changed == 0) ;
-    uart_write();
-#endif
+    /* wait object detection */
+    while (is_done == 0) ;
+
+    counter = ((uint32_t)high_part << 16) | (uint32_t)low_part;
+    uart_write(uint32_to_string(counter), 8);
   }
 
   return 0;
