@@ -36,12 +36,17 @@ static int ser_set_dtr_rts(int fd, int is_on)
   return 0;
 }
 
+static inline double to_msecs(uint32_t x)
+{
+  return (double)x / 16000.0;
+}
+
 int main(int ac, char** av)
 {
   static const serial_conf_t conf = { 9600, 8, SERIAL_PARITY_DISABLED, 1 };
 
   serial_handle_t h;
-  uint8_t buf[32];
+  uint32_t counter;
 
   if (serial_open(&h, "/dev/ttyACM0") == -1)
   {
@@ -71,14 +76,14 @@ int main(int ac, char** av)
 
   printf("readn()\n");
 
-  if (serial_readn(&h, buf, 8))
+  if (serial_readn(&h, (void*)&counter, sizeof(uint32_t)))
   {
     printf("serial_readn() == -1\n");
     goto on_error;
   }
-  buf[8] = 0;
 
-  printf("%s\n", buf);
+  if (counter == 0xffffffff) printf("timeout\n");
+  else printf("0x%08x, %lf ms\n", counter, to_msecs(counter));
 
  on_error:
   serial_close(&h);

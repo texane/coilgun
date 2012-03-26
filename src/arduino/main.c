@@ -55,6 +55,9 @@ static void uart_write(uint8_t* s, uint8_t n)
     while (!(UCSR0A & (1 << UDRE0))) ;
     UDR0 = *s;
   }
+
+  /* wait for last byte to be sent */
+  while ((UCSR0A & (1 << 6)) == 0) ;
 }
 
 static inline uint8_t nibble(uint32_t x, uint8_t i)
@@ -67,6 +70,7 @@ static inline uint8_t hex(uint8_t x)
   return (x >= 0xa) ? 'a' + x - 0xa : '0' + x;
 }
 
+__attribute__((unused))
 static uint8_t* uint32_to_string(uint32_t x)
 {
   static uint8_t buf[8];
@@ -120,12 +124,12 @@ ISR(PCINT0_vect)
   /* TODO: check it comes from PB0 */
   if (PCIFR & (1 << 0))
   {
-    /* stop the counters */
-    TCCR1B &= ~(1 << 0);
-    TCCR2B &= ~(1 << 0);
-
     /* read the counter */
     low_part = TCNT1;
+
+    /* stop the counters */
+    TCCR2B &= ~(7 << 0);
+    TCCR1B &= ~(7 << 0);
 
     is_done = 1;
 
@@ -150,8 +154,12 @@ ISR(TIMER2_OVF_vect)
   if (--timeout == 0)
   {
     /* stop the counters */
-    TCCR1B &= ~(1 << 0);
-    TCCR2B &= ~(1 << 0);
+    TCCR2B &= ~(7 << 0);
+    TCCR1B &= ~(7 << 0);
+
+    /* clear timer1 interrupt, if needed */
+    TIMSK1 = 0;
+    TIMSK2 = 0;
 
     /* invalidate the counter */
     low_part = (uint16_t)-1;
@@ -164,13 +172,14 @@ ISR(TIMER2_OVF_vect)
 int main(void)
 {
   uint32_t counter;
-  uint8_t cmd;
+
+ redo:
 
   uart_setup();
+  while (uart_read_byte() != 'f') ;
 
-  /* setup interrupt on change for b0 */
+  /* setup interrupt on change and pullup for b0 */
   DDRB &= 0xfe;
-  /* enable pullup */
   PORTB = 1;
 
 #if 0
@@ -179,7 +188,6 @@ int main(void)
   PORTB &= ~(1 << 0);
 #endif
 
-  /* enable interrupt on port change 0 */
   PCICR = 1 << 0;
   PCMSK0 = 1 << 0;
 
@@ -196,36 +204,35 @@ int main(void)
   /* global interrupt enable (SREG, i bit) */
   sei();
 
-  while (1)
-  {
-    cmd = uart_read_byte();
-    if (cmd != 'f') continue ;
+  /* reset the waiting flag */
+  is_done = 0;
 
-    /* reset the waiting flag */
-    is_done = 0;
+  /* reset counters */
+  timeout = 250;
+  low_part = 0;
+  high_part = 0;
+    
+  /* reload and start counters */
+  TCNT1 = 0;
+  TCNT2 = 0;
 
-    /* reset counters */
-    timeout = 122;
-    low_part = 0;
-    high_part = 0;
+  /* (255 * (1 / (16000000 / 1024))) * 122 = 2 seconds timeout */
+  TCCR2B = 7 << 0;
+  TCCR1B = 1 << 0;
 
-    /* reload and start counters */
-    TCNT1 = 0;
-    TCNT2 = 0;
+  /* fire */
+  pulse_pin();
 
-    /* (1 / (16000000 / 1024)) * 122 = 2 seconds timeout */
-    TCCR2B = 7 << 0;
-    TCCR1B = 1 << 0;
+  /* wait object detection */
+  while (is_done == 0) ;
 
-    /* fire */
-    pulse_pin();
+  cli();
 
-    /* wait object detection */
-    while (is_done == 0) ;
+  /* counter is sent little endian */
+  counter = ((uint32_t)high_part << 16) | (uint32_t)low_part;
+  uart_write((void*)&counter, sizeof(uint32_t));
 
-    counter = ((uint32_t)high_part << 16) | (uint32_t)low_part;
-    uart_write(uint32_to_string(counter), 8);
-  }
+  goto redo;
 
   return 0;
 }
